@@ -70,6 +70,11 @@ type model struct {
 	streaming strings.Builder
 	quitting  bool
 
+	// follow pins the log viewport to the bottom as new content arrives. It
+	// turns off when the user scrolls up (so streaming can't yank them back
+	// down) and re-enables once they return to the bottom or submit input.
+	follow bool
+
 	// pendingApproval holds the reply channel for a modal currently shown.
 	pendingApproval chan bool
 	modalSummary    string
@@ -84,6 +89,23 @@ const (
 	blockText blockKind = iota
 	// blockReasoning is the model's chain-of-thought, collapsible to a twistie.
 	blockReasoning
+	// blockSep is a horizontal rule marking the end of a turn.
+	blockSep
+)
+
+// role styles a text block so user prompts, answers, and tool chatter stay
+// visually distinct in the transcript.
+type role int
+
+const (
+	// rolePlain is system feedback, splash text, and completion notices.
+	rolePlain role = iota
+	// roleUser is the user's own prompt (rendered as a shaded chip).
+	roleUser
+	// roleAssistant is the model's visible answer.
+	roleAssistant
+	// roleTool is tool start/end chatter.
+	roleTool
 )
 
 // logBlock is one unit of log content. Text blocks hold pre-split display
@@ -93,6 +115,8 @@ const (
 type logBlock struct {
 	// kind discriminates the block.
 	kind blockKind
+	// role styles a text block; ignored for other kinds.
+	role role
 	// lines holds display rows for text blocks.
 	lines []string
 	// text is the full chain-of-thought for reasoning blocks.
@@ -104,14 +128,15 @@ type logBlock struct {
 	streaming bool
 }
 
-// lastTextBlock returns a pointer to the trailing text block, appending a fresh
-// one when the log ends in a non-text block (so appends after reasoning start
-// on their own line rather than merging into the chain-of-thought).
-func (m *model) lastTextBlock() *logBlock {
-	if n := len(m.blocks); n > 0 && m.blocks[n-1].kind == blockText {
+// textBlockFor returns a pointer to the trailing text block *of the same role*,
+// starting a new one when the log ends in a different block. Separating by role
+// is what keeps an answer from being concatenated onto the prompt that asked
+// for it.
+func (m *model) textBlockFor(r role) *logBlock {
+	if n := len(m.blocks); n > 0 && m.blocks[n-1].kind == blockText && m.blocks[n-1].role == r {
 		return &m.blocks[n-1]
 	}
-	m.blocks = append(m.blocks, logBlock{kind: blockText})
+	m.blocks = append(m.blocks, logBlock{kind: blockText, role: r})
 	return &m.blocks[len(m.blocks)-1]
 }
 
@@ -170,6 +195,7 @@ func New(opts Options) model {
 		input:   ti,
 		version: opts.Version,
 		author:  opts.Author,
+		follow:  true,
 	}
 	m.seedSplash()
 	return m
@@ -221,7 +247,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case channelClosedMsg:
-		m.appendLogBlock("[system] event stream ended")
+		m.appendBlock(rolePlain, "[system] event stream ended")
 		return m, nil
 
 	case eventMsg:
@@ -259,17 +285,20 @@ func (m model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.EventAssistantText:
 		m.closeReasoning()
 		if m.streaming.Len() > 0 {
-			m.appendLog("")
+			// The full text already reached the screen live; rendering it again
+			// would duplicate the answer, so just clear the stream marker.
 			m.streaming.Reset()
+		} else {
+			// No live stream (content arrived only with the final message).
+			m.appendBlock(roleAssistant, ev.Text)
 		}
-		m.appendLog("assistant: " + ev.Text)
 	case agent.EventToolStart:
 		m.closeReasoning()
-		m.appendLog(fmt.Sprintf("→ %s %s", ev.ToolName, compactArgs(ev.ToolArgs)))
+		m.appendLine(roleTool, fmt.Sprintf("→ %s %s", ev.ToolName, compactArgs(ev.ToolArgs)))
 	case agent.EventToolEnd:
-		m.appendLog(fmt.Sprintf("← %s [%s] (%dms)", ev.ToolName, ev.Result.Status, ev.Result.DurationMS))
+		m.appendLine(roleTool, fmt.Sprintf("← %s [%s] (%dms)", ev.ToolName, ev.Result.Status, ev.Result.DurationMS))
 		if ev.Result.Status == tools.StatusFailure && ev.Result.Stderr != "" {
-			m.appendLog("    " + firstLine(ev.Result.Stderr))
+			m.appendLine(roleTool, "    "+firstLine(ev.Result.Stderr))
 		}
 	case agent.EventPlanUpdated:
 		m.planItems = ev.Plan
@@ -277,7 +306,7 @@ func (m model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.pendingApproval = ev.Approval.Reply
 		m.modalSummary = ev.Approval.Call.Summary
 		m.confirmFocus = 0
-		m.appendLog("⚠ needs approval: " + ev.Approval.Call.Summary)
+		m.appendLine(rolePlain, "⚠ needs approval: "+ev.Approval.Call.Summary)
 		m.renderAll()
 		return m, tea.Batch(m.waitEvent())
 	case agent.EventError:
@@ -285,13 +314,17 @@ func (m model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if ev.Fatal {
 			prefix = "fatal"
 		}
-		m.appendLog(fmt.Sprintf("[%s] %v", prefix, ev.Err))
+		m.appendLine(rolePlain, fmt.Sprintf("[%s] %v", prefix, ev.Err))
+		if ev.Fatal {
+			m.appendSeparator()
+		}
 	case agent.EventDone:
 		m.closeReasoning()
-		m.appendLog("[done] " + ev.Text)
+		m.appendLine(rolePlain, "[done] "+ev.Text)
+		m.appendSeparator()
 		m.state = agent.StateIdle
 	case agent.EventSystem:
-		m.appendLogBlock(ev.Text)
+		m.appendBlock(rolePlain, ev.Text)
 	}
 	m.renderAll()
 	return m, m.waitEvent()
@@ -310,7 +343,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.ctrl != nil {
 			m.ctrl.Stop()
 		}
-		m.appendLog("[system] interrupted (ctrl+s)")
+		m.appendLine(rolePlain, "[system] interrupted (ctrl+s)")
+		m.appendSeparator()
 		m.state = agent.StateIdle
 		m.renderAll()
 		return m, nil
@@ -322,11 +356,58 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		return m.submitLine()
+	case "pgup":
+		return m.scroll(func(v *viewport.Model) { v.PageUp() })
+	case "pgdn":
+		return m.scroll(func(v *viewport.Model) { v.PageDown() })
+	case "shift+up":
+		return m.scroll(func(v *viewport.Model) { v.LineUp(1) })
+	case "shift+down":
+		return m.scroll(func(v *viewport.Model) { v.LineDown(1) })
+	case "up":
+		// Only scroll when the input is empty so arrow keys keep their usual
+		// text-editing role while a prompt is being typed.
+		if m.input.Value() == "" {
+			return m.scroll(func(v *viewport.Model) { v.LineUp(1) })
+		}
+	case "down":
+		if m.input.Value() == "" {
+			return m.scroll(func(v *viewport.Model) { v.LineDown(1) })
+		}
+	case "home":
+		if m.input.Value() == "" {
+			return m.scroll(func(v *viewport.Model) { v.GotoTop() })
+		}
+	case "end":
+		if m.input.Value() == "" {
+			return m.scroll(func(v *viewport.Model) { v.GotoBottom() })
+		}
 	default:
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		return m, cmd
 	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// scroll runs a viewport scroll operation against the receiver's own log, then
+// reconciles follow mode: scrolling up suspends auto-follow, and returning to
+// the bottom resumes it. Content is refreshed before AtBottom is sampled so the
+// check reflects the real line count rather than the previous frame's. The
+// operation receives the viewport explicitly so it cannot accidentally mutate a
+// different copy of the model.
+func (m *model) scroll(do func(*viewport.Model)) (tea.Model, tea.Cmd) {
+	do(&m.log)
+	m.log.SetContent(strings.Join(m.renderLogLines(), "\n"))
+	if m.log.AtBottom() {
+		m.follow = true
+		m.log.GotoBottom()
+	} else {
+		m.follow = false
+	}
+	return m, nil
 }
 
 // submitLine dispatches the typed line: slash commands go to the controller's
@@ -339,10 +420,10 @@ func (m model) submitLine() (tea.Model, tea.Cmd) {
 	m.input.SetValue("")
 
 	if strings.HasPrefix(text, "/") {
-		m.appendLog("› " + text)
+		m.appendLine(roleUser, "› "+text)
 		feedback, quit := m.ctrl.HandleCommand(text)
 		if feedback != "" {
-			m.appendLogBlock(feedback)
+			m.appendBlock(rolePlain, feedback)
 		}
 		if quit {
 			m.ctrl.Shutdown()
@@ -354,7 +435,11 @@ func (m model) submitLine() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	m.appendLog("you: " + text)
+	m.appendLine(roleUser, "you: "+text)
+	// Submitting means the user wants to see what happens next: snap back to
+	// live output even if they had scrolled up to read history.
+	m.follow = true
+	m.renderLog()
 	m.ctrl.Submit(text)
 	m.renderAll()
 	return m, nil
@@ -394,37 +479,57 @@ func (m *model) layout() {
 	m.log = viewport.New(logW, bodyH)
 }
 
-func (m *model) appendLog(line string) {
-	b := m.lastTextBlock()
+// appendLine adds one row to the trailing block of role r.
+func (m *model) appendLine(r role, line string) {
+	b := m.textBlockFor(r)
 	b.lines = append(b.lines, line)
 	m.renderLog()
 }
 
-// appendLogBlock adds multi-line feedback (help, status) as separate rows.
-func (m *model) appendLogBlock(s string) {
-	b := m.lastTextBlock()
+// appendBlock adds multi-line content (help, status) as separate rows of role r.
+func (m *model) appendBlock(r role, s string) {
+	b := m.textBlockFor(r)
 	b.lines = append(b.lines, strings.Split(s, "\n")...)
 	m.renderLog()
 }
 
+// appendDelta folds streamed answer text into the live assistant block,
+// starting a fresh line when the previous block was anything else.
 func (m *model) appendDelta(delta string) {
-	b := m.lastTextBlock()
+	b := m.textBlockFor(roleAssistant)
 	if len(b.lines) == 0 {
-		b.lines = append(b.lines, "")
+		b.lines = append(b.lines, delta)
+	} else {
+		b.lines[len(b.lines)-1] += delta
 	}
-	b.lines[len(b.lines)-1] += delta
+	m.renderLog()
+}
+
+// appendSeparator draws a horizontal rule marking the end of a turn. It is a
+// no-op when the log already ends in a separator, so a run that both fails and
+// reports done cannot stack two rules.
+func (m *model) appendSeparator() {
+	if n := len(m.blocks); n > 0 && m.blocks[n-1].kind == blockSep {
+		return
+	}
+	m.blocks = append(m.blocks, logBlock{kind: blockSep})
 	m.renderLog()
 }
 
 // renderLog flattens the block list into display rows and repaints the viewport.
+// It only pins to the bottom when following, so a user who scrolled up is not
+// yanked back down by streaming output.
 func (m *model) renderLog() {
 	m.log.SetContent(strings.Join(m.renderLogLines(), "\n"))
-	m.log.GotoBottom()
+	if m.follow {
+		m.log.GotoBottom()
+	}
 }
 
 // renderLogLines expands or collapses each block per its state: reasoning
 // streams live and dimmed while in flight, then folds to a twistie line unless
-// toggled open. Text blocks render their rows verbatim.
+// toggled open; text blocks render their rows with per-role styling; separators
+// become a horizontal rule spanning the panel.
 func (m *model) renderLogLines() []string {
 	width := m.log.Width
 	if width <= 0 {
@@ -432,26 +537,48 @@ func (m *model) renderLogLines() []string {
 	}
 	var out []string
 	for _, b := range m.blocks {
-		if b.kind == blockText {
-			out = append(out, b.lines...)
-			continue
-		}
-		wrapped := wrapText(b.text, max(1, width-2))
-		if b.streaming || b.open {
-			out = append(out, reasoningHeaderStyle.Render("✦ thinking…"))
-			for _, line := range wrapped {
-				out = append(out, reasoningTextStyle.Render(line))
+		switch b.kind {
+		case blockSep:
+			out = append(out, sepStyle.Render(strings.Repeat("─", width)))
+		case blockText:
+			styler := roleStyle(b.role)
+			for _, line := range b.lines {
+				out = append(out, styler.Render(line))
 			}
-			continue
+		case blockReasoning:
+			wrapped := wrapText(b.text, max(1, width-2))
+			if b.streaming || b.open {
+				out = append(out, reasoningHeaderStyle.Render("✦ thinking…"))
+				for _, line := range wrapped {
+					out = append(out, reasoningTextStyle.Render(line))
+				}
+				continue
+			}
+			n := len(wrapped)
+			if b.text == "" {
+				n = 0
+			}
+			out = append(out, reasoningCollapsedStyle.Render(
+				fmt.Sprintf("▸ thinking · %d line%s · ctrl+t to expand", n, plural(n))))
 		}
-		n := len(wrapped)
-		if b.text == "" {
-			n = 0
-		}
-		out = append(out, reasoningCollapsedStyle.Render(
-			fmt.Sprintf("▸ thinking · %d line%s · ctrl+t to expand", n, plural(n))))
 	}
 	return out
+}
+
+// roleStyle maps a block role to its rendering style: the user's prompt is a
+// shaded chip, tool chatter recedes into dim grey, and the answer stays at
+// terminal default so it reads as the primary content.
+func roleStyle(r role) lipgloss.Style {
+	switch r {
+	case roleUser:
+		return userStyle
+	case roleTool:
+		return toolStyle
+	case roleAssistant:
+		return assistantStyle
+	default:
+		return plainStyle
+	}
 }
 
 // wrapText word-wraps s to width, preserving explicit newlines and hard-breaking
@@ -557,6 +684,15 @@ var (
 	reasoningHeaderStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
 	reasoningTextStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Italic(true)
 	reasoningCollapsedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+
+	// Transcript roles: the user's prompt is a shaded chip so it separates at
+	// a glance from the answer, tool chatter recedes, and the answer itself
+	// stays at terminal default so it carries the most weight.
+	userStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Background(lipgloss.Color("236"))
+	assistantStyle = lipgloss.NewStyle()
+	toolStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	plainStyle     = lipgloss.NewStyle()
+	sepStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 )
 
 // View renders the full interface.
@@ -574,7 +710,7 @@ func (m model) View() string {
 	right := logStyle.Width(m.log.Width).Render(m.log.View())
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 	prompt := inputStyle.Render("› ") + m.input.View()
-	hint := hintStyle.Render("/help commands · ctrl+t thinking")
+	hint := hintStyle.Render("/help commands · ctrl+t thinking · pgup/pgdn scroll")
 	return lipgloss.JoinVertical(lipgloss.Left, body, statusStyle.Render(m.statusBarText()), prompt, hint)
 }
 
