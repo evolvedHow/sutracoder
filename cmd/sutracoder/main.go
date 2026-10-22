@@ -25,7 +25,7 @@ import (
 var version = "dev"
 
 // author is credited on the startup splash.
-const author = "vgana"
+const author = "vish.ganapathy"
 
 func main() {
 	if err := run(); err != nil {
